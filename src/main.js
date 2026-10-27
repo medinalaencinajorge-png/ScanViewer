@@ -10,7 +10,11 @@ const els = {
   name: $('model-name'), file: $('file-input'), library: $('library'), list: $('library-list'),
   empty: $('library-empty'), hint: $('hint'), status: $('status'), label: $('measure-label'),
   measure: $('btn-measure'), clear: $('btn-clear'), calibrate: $('btn-calibrate'), wire: $('btn-wire'), reset: $('btn-reset'), stl: $('btn-stl'),
+  edit: $('btn-edit'), panel: $('edit-panel'), axis: $('cut-axis'), side: $('cut-side'), pos: $('cut-pos'),
+  apply: $('cut-apply'), del: $('edit-delete'), clean: $('edit-clean'), check: $('edit-check'), undo: $('edit-undo'), info: $('edit-info'),
+  flatten: $('edit-flatten'), flatRadius: $('flat-radius'), flatRadiusValue: $('flat-radius-value'), flatApply: $('flat-apply'),
 };
+const INFO_DEFAULT = 'Mueve el deslizador: lo amarillo marca el plano y se oculta lo que se quitaría.';
 
 let viewer;
 let current = null;       // metadatos del modelo abierto (null si no hay o no está guardado)
@@ -75,6 +79,60 @@ function activate(meta) {
   els.library.hidden = true;
   els.status.hidden = true;
   els.stl.disabled = false;
+  els.edit.disabled = false;
+  els.pos.value = '0';
+  if (!els.panel.hidden) updatePreview();
+}
+
+function updatePreview() {
+  viewer.previewCut(Number(els.axis.value), Number(els.pos.value) / 1000, els.side.getAttribute('aria-pressed') === 'true');
+}
+
+function setEditOpen(open) {
+  els.panel.hidden = !open;
+  els.edit.setAttribute('aria-pressed', String(open));
+  if (open) updatePreview();
+  else {
+    viewer.endPreview();
+    if (['delete', 'flatten'].includes(activeTool)) setTool(null);
+  }
+}
+
+const TOOL_BUTTONS = { measure: els.measure, delete: els.del, flatten: els.flatten };
+const TOOL_HINTS = {
+  measure: 'Toca dos puntos del modelo',
+  delete: 'Toca la pieza suelta que quieres borrar',
+  flatten: 'Toca la zona que quieres aplanar',
+};
+let activeTool = null;
+
+/** Solo una herramienta de toque a la vez: medir, borrar pieza o aplanar zona. */
+function setTool(tool) {
+  activeTool = tool;
+  for (const [name, button] of Object.entries(TOOL_BUTTONS)) button.setAttribute('aria-pressed', String(name === tool));
+  viewer.setMeasuring(tool === 'measure');
+  viewer.setDeleteMode(tool === 'delete');
+  viewer.setFlattenMode(tool === 'flatten');
+  if (tool) showStatus(TOOL_HINTS[tool], false, 3000);
+}
+
+const toggleTool = (tool) => setTool(activeTool === tool ? null : tool);
+
+let busy = false;
+
+/** Ejecuta una edición pesada mostrando "…" antes de bloquear el hilo; ignora toques mientras trabaja. */
+async function runEdit(label, fn) {
+  if (busy) return false;
+  busy = true;
+  els.panel.toggleAttribute('inert', true);
+  showStatus(`${label}…`, false, 0);
+  try {
+    await tick();
+    return fn() !== false;
+  } finally {
+    busy = false;
+    els.panel.toggleAttribute('inert', false);
+  }
 }
 
 async function saveBlob(blob, filename) {
@@ -149,6 +207,8 @@ async function removeRecord(meta) {
       els.name.textContent = DEFAULT_TITLE;
       els.hint.hidden = false;
       els.stl.disabled = true;
+      els.edit.disabled = true;
+      setEditOpen(false);
     }
     await refreshLibrary();
   } catch (err) {
@@ -194,6 +254,13 @@ function init() {
         els.calibrate.disabled = raw === null;
         if (raw !== null) viewer.setLabel(formatDistance(raw));
       },
+      onEdit({ message, error, canUndo, canFlatten }) {
+        els.undo.disabled = !canUndo;
+        els.flatApply.disabled = !canFlatten;
+        if (!message) { els.info.textContent = INFO_DEFAULT; return; }
+        els.info.textContent = message;
+        showStatus(message, error, 7000);
+      },
     });
   } catch (err) {
     els.file.disabled = true;
@@ -204,12 +271,34 @@ function init() {
   els.file.addEventListener('change', handleUpload);
   $('btn-library').addEventListener('click', () => { els.library.hidden = !els.library.hidden; });
 
-  els.measure.addEventListener('click', () => {
-    const on = els.measure.getAttribute('aria-pressed') !== 'true';
-    els.measure.setAttribute('aria-pressed', String(on));
-    viewer.setMeasuring(on);
-    if (on) showStatus('Toca dos puntos del modelo', false, 2500);
+  els.measure.addEventListener('click', () => toggleTool('measure'));
+
+  els.edit.addEventListener('click', () => setEditOpen(els.panel.hidden));
+  els.axis.addEventListener('change', updatePreview);
+  els.pos.addEventListener('input', updatePreview);
+  els.side.addEventListener('click', () => {
+    const on = els.side.getAttribute('aria-pressed') !== 'true';
+    els.side.setAttribute('aria-pressed', String(on));
+    els.side.textContent = on ? 'Conservar lado +' : 'Conservar lado −';
+    updatePreview();
   });
+  els.apply.addEventListener('click', async () => {
+    const [axis, t, keep] = [Number(els.axis.value), Number(els.pos.value) / 1000, els.side.getAttribute('aria-pressed') === 'true'];
+    if (await runEdit('Cortando', () => viewer.applyCut(axis, t, keep))) {
+      els.pos.value = '0'; // si falla, el deslizador conserva la posición elegida
+      updatePreview();
+    }
+  });
+  els.del.addEventListener('click', () => toggleTool('delete'));
+  els.flatten.addEventListener('click', () => toggleTool('flatten'));
+  els.flatRadius.addEventListener('input', () => {
+    els.flatRadiusValue.textContent = `${els.flatRadius.value} %`;
+    viewer.setFlattenRadius(Number(els.flatRadius.value) / 100);
+  });
+  els.flatApply.addEventListener('click', () => runEdit('Aplanando', () => viewer.applyFlatten()));
+  els.clean.addEventListener('click', () => runEdit('Limpiando', () => viewer.cleanFragments()));
+  els.check.addEventListener('click', () => runEdit('Analizando la malla', () => viewer.checkMesh()));
+  els.undo.addEventListener('click', () => viewer.undo());
 
   els.clear.addEventListener('click', () => viewer.clearMeasure());
 

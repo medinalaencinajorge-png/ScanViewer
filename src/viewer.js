@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import {
+  clipGeometry, findComponents, subsetComponents, meshHealth, filterTriangles, flattenRegion, triangleCount, NoSurfaceError,
+} from './meshEdit.js';
+
+const MAX_UNDO = 5;
 
 const MAX_VERTICES = 20_000_000;
 
@@ -85,10 +90,21 @@ export class Viewer {
   #loadSeq = 0;
   #dirty = true;
 
-  constructor(container, labelEl, { onMeasure } = {}) {
+  constructor(container, labelEl, { onMeasure, onEdit } = {}) {
     this.container = container;
     this.labelEl = labelEl;
     this.onMeasure = onMeasure ?? (() => {});
+    this.onEdit = onEdit ?? (() => {});
+    this.deleteMode = false;
+    this.flattenMode = false;
+    this.flattenPick = null;
+    this.flattenMarker = null;
+    this.flattenFraction = 0.1; // radio de aplanado como fracción del radio del modelo
+    this.lastPreview = null;
+    this.undoStack = [];
+    this.componentCache = new WeakMap();
+    this.previewPlane = null;
+    this.planeHelper = null;
     this.model = null;
     this.pickables = [];
     this.radius = 1;
@@ -147,6 +163,8 @@ export class Viewer {
       throw err;
     }
     this.clearMeasure();
+    this.endPreview();
+    this.#clearFlattenPick();
     this.#removeModel();
     this.model = object;
     this.pickables = pickables;
@@ -155,12 +173,297 @@ export class Viewer {
     this.resetView();
   }
 
+  // ------------------------------------------------------------------ edición
+
+  #emitEdit(message, error = false) {
+    this.onEdit({ message, error, canUndo: this.undoStack.length > 0, canFlatten: Boolean(this.flattenPick) });
+  }
+
+  #editableMeshes() {
+    if (!this.model) throw new Error('No hay ningún modelo abierto');
+    const meshes = this.pickables.filter((p) => p.isMesh && triangleCount(p.geometry) > 0);
+    if (!meshes.length) throw new Error('Solo se pueden editar mallas con triángulos, no nubes de puntos');
+    if (meshes.some((m) => Array.isArray(m.material))) throw new Error('Este modelo usa varios materiales por malla: edición no soportada');
+    if (meshes.some((m) => m.isSkinnedMesh || Object.keys(m.geometry.morphAttributes).length)) throw new Error('Este modelo tiene animación (huesos o morph targets): edición no soportada');
+    return meshes;
+  }
+
+  /** Aplica geometrías nuevas guardando las antiguas para poder deshacer. */
+  #commit(changes) {
+    let heavy = false;
+    const entry = changes.map(({ mesh, geometry }) => {
+      const previous = mesh.geometry;
+      previous.dispose(); // libera la copia en GPU; si se deshace, three la vuelve a subir
+      mesh.geometry = geometry;
+      geometry.computeBoundingBox();
+      geometry.computeBoundingSphere();
+      if (triangleCount(previous) > 1_000_000) heavy = true;
+      return { mesh, geometry: previous };
+    });
+    this.undoStack.push(entry);
+    const limit = heavy ? 1 : MAX_UNDO; // en mallas grandes, cada paso guardado cuesta cientos de MB
+    while (this.undoStack.length > limit) this.#disposeEntry(this.undoStack.shift());
+    this.#refreshPreview();
+    this.invalidate();
+  }
+
+  #disposeEntry(entry) {
+    for (const e of entry) e.geometry.dispose();
+  }
+
+  #clearUndo() {
+    for (const entry of this.undoStack) this.#disposeEntry(entry);
+    this.undoStack = [];
+    this.onEdit({ message: '', error: false, canUndo: false, canFlatten: false });
+  }
+
+  undo() {
+    const entry = this.undoStack.pop();
+    if (!entry) return;
+    for (const { mesh, geometry } of entry) { mesh.geometry.dispose(); mesh.geometry = geometry; }
+    this.#refreshPreview();
+    this.invalidate();
+    this.#emitEdit('Cambio deshecho');
+  }
+
+  #components(mesh) {
+    let result = this.componentCache.get(mesh.geometry);
+    if (!result) { result = findComponents(mesh.geometry); this.componentCache.set(mesh.geometry, result); }
+    return result;
+  }
+
+  /** Quita piezas enteras de una malla y reutiliza las piezas ya calculadas para la geometría nueva. */
+  #removePieces(mesh, comps, drop) {
+    const keep = (t) => !drop(comps.compOf[t]);
+    const geometry = filterTriangles(mesh.geometry, keep);
+    this.componentCache.set(geometry, subsetComponents(comps, keep));
+    return { mesh, geometry };
+  }
+
+  setDeleteMode(on) { this.deleteMode = on; }
+
+  #deleteHit(hit) {
+    try {
+      const mesh = hit.object;
+      if (!mesh.isMesh || hit.faceIndex == null) return;
+      this.#editableMeshes(); // comprueba materiales múltiples, animación, etc.
+      const comps = this.#components(mesh);
+      if (comps.sizes.length < 2) return this.#emitEdit('Esa es la única pieza del modelo; usa el corte para recortarla', true);
+      const target = comps.compOf[hit.faceIndex];
+      this.#commit([this.#removePieces(mesh, comps, (c) => c === target)]);
+      this.#emitEdit(`Pieza borrada (${comps.sizes[target].toLocaleString('es')} triángulos)`);
+    } catch (err) {
+      this.#emitEdit(`No se pudo borrar: ${err.message}`, true);
+    }
+  }
+
+  /** Elimina las piezas sueltas cuya superficie es menor que `fraction` de la de la mayor de su malla. */
+  cleanFragments(fraction = 0.05) {
+    try {
+      const changes = [];
+      let removed = 0;
+      for (const mesh of this.#editableMeshes()) {
+        const { compOf, areas, sizes } = this.#components(mesh);
+        const largest = areas.reduce((m, s) => Math.max(m, s), 0);
+        const dropped = areas.map((s) => s < largest * fraction);
+        const count = dropped.filter(Boolean).length;
+        if (!count) continue;
+        removed += count;
+        changes.push(this.#removePieces(mesh, { compOf, areas, sizes }, (c) => dropped[c]));
+      }
+      if (!changes.length) return this.#emitEdit('No hay fragmentos pequeños que limpiar');
+      this.#commit(changes);
+      this.#emitEdit(`Fragmentos eliminados: ${removed}`);
+    } catch (err) {
+      this.#emitEdit(`No se pudo limpiar: ${err.message}`, true);
+    }
+  }
+
+  /** Informa de si la malla está cerrada (imprimible) o tiene agujeros. */
+  checkMesh() {
+    try {
+      let open = 0, nonManifold = 0, triangles = 0;
+      for (const mesh of this.#editableMeshes()) {
+        const h = meshHealth(mesh.geometry);
+        open += h.open; nonManifold += h.nonManifold; triangles += h.triangles;
+      }
+      const count = triangles.toLocaleString('es');
+      if (!open && !nonManifold) return this.#emitEdit(`Malla cerrada: sin agujeros ni bordes abiertos (${count} triángulos). No se comprueba la orientación de las caras; el laminador lo revisará.`);
+      const problems = [open && `${open.toLocaleString('es')} bordes abiertos`, nonManifold && `${nonManifold.toLocaleString('es')} bordes no manifold`].filter(Boolean).join(' y ');
+      this.#emitEdit(`Malla con ${problems}. Corta la base con un plano o deja que el laminador la repare.`, true);
+    } catch (err) {
+      this.#emitEdit(`No se pudo comprobar: ${err.message}`, true);
+    }
+  }
+
+  #worldPlane(axis, t01, keepPositive) {
+    const box = new THREE.Box3().setFromObject(this.model);
+    const lo = box.min.getComponent(axis);
+    const at = lo + (box.max.getComponent(axis) - lo) * t01;
+    const normal = new THREE.Vector3();
+    normal.setComponent(axis, keepPositive ? 1 : -1);
+    return new THREE.Plane(normal, keepPositive ? -at : at);
+  }
+
+  /** Muestra en vivo (sin modificar nada) qué quedaría tras el corte. */
+  previewCut(axis, t01, keepPositive) {
+    if (!this.model) return;
+    this.lastPreview = [axis, t01, keepPositive];
+    const plane = this.#worldPlane(axis, t01, keepPositive);
+    if (!this.previewPlane) this.previewPlane = new THREE.Plane();
+    this.previewPlane.copy(plane);
+    if (!this.planeHelper) {
+      const size = new THREE.Box3().setFromObject(this.model).getSize(new THREE.Vector3()).length();
+      this.planeHelper = new THREE.PlaneHelper(this.previewPlane, size, 0xffd23f);
+      this.scene.add(this.planeHelper);
+    }
+    this.renderer.clippingPlanes = [this.previewPlane];
+    this.invalidate();
+  }
+
+  /** Tras deshacer o borrar, la caja del modelo cambia: recalcula el plano y su tamaño. */
+  #refreshPreview() {
+    if (!this.previewPlane || !this.lastPreview) return;
+    const args = this.lastPreview;
+    this.#disposeHelper();
+    this.previewCut(...args);
+  }
+
+  #disposeHelper() {
+    if (!this.planeHelper) return;
+    this.scene.remove(this.planeHelper);
+    this.planeHelper.geometry.dispose();
+    this.planeHelper.material.dispose();
+    this.planeHelper = null;
+  }
+
+  endPreview() {
+    this.lastPreview = null;
+    this.renderer.clippingPlanes = [];
+    this.#disposeHelper();
+    this.previewPlane = null;
+    this.invalidate();
+  }
+
+  /** Recorta de verdad la geometría y cierra la sección con una tapa. */
+  applyCut(axis, t01, keepPositive) {
+    try {
+      const meshes = this.#editableMeshes();
+      const world = this.#worldPlane(axis, t01, keepPositive);
+      const changes = [];
+      let triangles = 0, loops = 0, openLoops = 0, ambiguous = false;
+      for (const mesh of meshes) {
+        mesh.updateWorldMatrix(true, false);
+        const local = world.clone().applyMatrix4(mesh.matrixWorld.clone().invert());
+        const result = clipGeometry(mesh.geometry, local);
+        triangles += triangleCount(result.geometry);
+        loops += result.loops;
+        openLoops += result.openLoops;
+        ambiguous ||= result.ambiguous;
+        changes.push({ mesh, geometry: result.geometry });
+      }
+      if (!triangles) {
+        for (const c of changes) c.geometry.dispose();
+        this.#emitEdit('El corte dejaría el modelo vacío', true);
+        return false;
+      }
+      this.#commit(changes);
+      const notes = [
+        openLoops && `No se pudo cerrar ${openLoops} contorno(s): la malla original tiene agujeros.`,
+        ambiguous && 'Hay contornos que se tocan: comprueba la malla.',
+        !openLoops && !ambiguous && loops && 'Sección cerrada con tapa.',
+      ].filter(Boolean).join(' ');
+      this.#emitEdit(`Corte aplicado (${triangles.toLocaleString('es')} triángulos). ${notes}`.trim(), openLoops > 0 || ambiguous);
+      return true;
+    } catch (err) {
+      this.#emitEdit(`No se pudo cortar: ${err.message}`, true);
+      return false;
+    }
+  }
+
+  // ------------------------------------------------------------------ aplanar zona
+
+  setFlattenMode(on) {
+    this.flattenMode = on;
+    if (!on) this.#clearFlattenPick();
+  }
+
+  /** Radio de la zona a aplanar como fracción del radio del modelo (0.01–0.5). */
+  setFlattenRadius(fraction) {
+    this.flattenFraction = fraction;
+    if (this.flattenMarker) this.flattenMarker.scale.setScalar(this.radius * fraction);
+    this.invalidate();
+  }
+
+  #pickFlatten(hit) {
+    if (!hit.object.isMesh) return this.#emitEdit('Solo se pueden aplanar mallas, no nubes de puntos', true);
+    this.flattenPick = { point: hit.point.clone() };
+    if (!this.flattenMarker) {
+      this.flattenMarker = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 24, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffd23f, wireframe: true, transparent: true, opacity: 0.5, depthTest: false }),
+      );
+      this.flattenMarker.renderOrder = 997;
+      this.scene.add(this.flattenMarker);
+    }
+    this.flattenMarker.position.copy(hit.point);
+    this.flattenMarker.scale.setScalar(this.radius * this.flattenFraction);
+    this.invalidate();
+    this.#emitEdit('Zona elegida. Ajusta el radio con el deslizador y pulsa «Aplanar».');
+  }
+
+  #clearFlattenPick() {
+    this.flattenPick = null;
+    if (this.flattenMarker) {
+      this.scene.remove(this.flattenMarker);
+      this.flattenMarker.geometry.dispose();
+      this.flattenMarker.material.dispose();
+      this.flattenMarker = null;
+    }
+    this.onEdit({ message: '', error: false, canUndo: this.undoStack.length > 0, canFlatten: false });
+    this.invalidate();
+  }
+
+  /** Aplana la zona elegida: el interior queda exactamente plano y el borde se mezcla con la superficie. */
+  applyFlatten() {
+    try {
+      if (!this.flattenPick) { this.#emitEdit('Toca primero la zona que quieres aplanar', true); return false; }
+      const meshes = this.#editableMeshes();
+      const worldCenter = this.flattenPick.point;
+      const worldRadius = this.radius * this.flattenFraction;
+      const changes = [];
+      let moved = 0;
+      for (const mesh of meshes) {
+        mesh.updateWorldMatrix(true, false);
+        const localCenter = worldCenter.clone().applyMatrix4(mesh.matrixWorld.clone().invert());
+        const localRadius = worldRadius / (mesh.matrixWorld.getMaxScaleOnAxis() || 1);
+        try {
+          const result = flattenRegion(mesh.geometry, localCenter, localRadius);
+          moved += result.moved;
+          changes.push({ mesh, geometry: result.geometry });
+        } catch (err) {
+          if (!(err instanceof NoSurfaceError)) throw err; // esta malla no tiene superficie en la zona
+        }
+      }
+      if (!changes.length) { this.#emitEdit(new NoSurfaceError().message, true); return false; }
+      this.#commit(changes);
+      this.#clearFlattenPick();
+      this.#emitEdit(`Zona aplanada (${moved.toLocaleString('es')} vértices). El centro queda plano y el borde se funde con la superficie.`);
+      return true;
+    } catch (err) {
+      this.#emitEdit(`No se pudo aplanar: ${err.message}`, true);
+      return false;
+    }
+  }
+
   /** Exporta el modelo abierto como STL binario en milímetros. `scale` convierte las unidades del modelo a metros. */
   async exportStl(scale) {
-    if (!this.model) throw new Error('No hay ningún modelo abierto');
+    const model = this.model;
+    if (!model) throw new Error('No hay ningún modelo abierto');
     const { STLExporter } = await import('three/examples/jsm/exporters/STLExporter.js');
+    if (this.model !== model) throw new Error('El modelo cambió mientras se exportaba; inténtalo de nuevo');
     const group = new THREE.Group();
-    group.add(this.model.clone(true)); // comparte geometrías: no se libera
+    group.add(model.clone(true)); // comparte geometrías: no se libera
     group.scale.setScalar(scale * 1000);
     group.updateMatrixWorld(true);
     const size = new THREE.Box3().setFromObject(group).getSize(new THREE.Vector3());
@@ -171,11 +474,14 @@ export class Viewer {
   unload() {
     this.#loadSeq++; // invalida cargas en curso
     this.clearMeasure();
+    this.endPreview();
+    this.#clearFlattenPick();
     this.#removeModel();
     this.invalidate();
   }
 
   #removeModel() {
+    this.#clearUndo();
     if (!this.model) return;
     this.scene.remove(this.model);
     disposeObject(this.model);
@@ -236,7 +542,7 @@ export class Viewer {
   #handlePointerUp(e) {
     const start = this.pointerStart;
     this.pointerStart = null;
-    if (!this.measuring || !start || !this.model) return;
+    if (!(this.measuring || this.deleteMode || this.flattenMode) || !start || !this.model) return;
     if (!e.isPrimary || e.pointerId !== start.id || e.button !== 0) return;
     if (Math.hypot(e.clientX - start.x, e.clientY - start.y) > 6) return; // arrastre = girar cámara
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -245,8 +551,13 @@ export class Viewer {
     this.camera.updateMatrixWorld();
     this.model.updateMatrixWorld(true);
     this.raycaster.setFromCamera(ndc, this.camera);
-    const hit = this.raycaster.intersectObjects(this.pickables, false)[0];
-    if (hit && Number.isFinite(hit.point.x + hit.point.y + hit.point.z)) this.#addPoint(hit.point.clone());
+    // el raycaster ignora los planos de recorte: descarta lo que la previsualización ya oculta
+    const hit = this.raycaster.intersectObjects(this.pickables, false)
+      .find((h) => !this.previewPlane || this.previewPlane.distanceToPoint(h.point) >= 0);
+    if (!hit || !Number.isFinite(hit.point.x + hit.point.y + hit.point.z)) return;
+    if (this.deleteMode) this.#deleteHit(hit);
+    else if (this.flattenMode) this.#pickFlatten(hit);
+    else this.#addPoint(hit.point.clone());
   }
 
   #addPoint(point) {
