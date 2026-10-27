@@ -9,7 +9,7 @@ const $ = (id) => document.getElementById(id);
 const els = {
   name: $('model-name'), file: $('file-input'), library: $('library'), list: $('library-list'),
   empty: $('library-empty'), hint: $('hint'), status: $('status'), label: $('measure-label'),
-  measure: $('btn-measure'), clear: $('btn-clear'), calibrate: $('btn-calibrate'), wire: $('btn-wire'), reset: $('btn-reset'),
+  measure: $('btn-measure'), clear: $('btn-clear'), calibrate: $('btn-calibrate'), wire: $('btn-wire'), reset: $('btn-reset'), stl: $('btn-stl'),
 };
 
 let viewer;
@@ -74,6 +74,32 @@ function activate(meta) {
   els.hint.hidden = true;
   els.library.hidden = true;
   els.status.hidden = true;
+  els.stl.disabled = false;
+}
+
+async function saveBlob(blob, filename) {
+  const file = new File([blob], filename, { type: blob.type });
+  if (navigator.canShare?.({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return; } catch (err) { if (err.name === 'AbortError') return; }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function exportStl() {
+  const scale = current ? readScale(current.id) : null;
+  try {
+    const { blob, size } = await viewer.exportStl(scale ?? 1);
+    const dims = [size.x, size.y, size.z].map((v) => v.toFixed(1)).join(' × ');
+    showStatus(scale ? `STL en mm: ${dims}` : `STL sin calibrar (se asume metros): ${dims} mm`, !scale, 6000);
+    await saveBlob(blob, `${els.name.textContent}.stl`);
+  } catch (err) {
+    showStatus(`No se pudo exportar: ${err.message}`, true, 6000);
+  }
 }
 
 async function openRecord(meta) {
@@ -122,6 +148,7 @@ async function removeRecord(meta) {
       current = null;
       els.name.textContent = DEFAULT_TITLE;
       els.hint.hidden = false;
+      els.stl.disabled = true;
     }
     await refreshLibrary();
   } catch (err) {
@@ -206,6 +233,8 @@ function init() {
   });
 
   els.reset.addEventListener('click', () => viewer.resetView());
+  els.stl.addEventListener('click', exportStl);
+  if (import.meta.env.DEV) window.__viewer = viewer; // solo para depurar en desarrollo
 
   refreshLibrary().catch((err) => showStatus(`Biblioteca no disponible: ${err.message}`, true, 6000));
 }

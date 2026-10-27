@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 
 const MAX_VERTICES = 20_000_000;
 
@@ -103,7 +104,11 @@ export class Viewer {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0f1115);
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.6));
+    // Sin entorno, los materiales metálicos/PBR de los GLB se ven negros.
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 0.8));
     const sun = new THREE.DirectionalLight(0xffffff, 1.4);
     sun.position.set(3, 5, 4);
     this.scene.add(sun, this.overlay);
@@ -148,6 +153,19 @@ export class Viewer {
     this.scene.add(object);
     this.wireframe(this.wireframeOn);
     this.resetView();
+  }
+
+  /** Exporta el modelo abierto como STL binario en milímetros. `scale` convierte las unidades del modelo a metros. */
+  async exportStl(scale) {
+    if (!this.model) throw new Error('No hay ningún modelo abierto');
+    const { STLExporter } = await import('three/examples/jsm/exporters/STLExporter.js');
+    const group = new THREE.Group();
+    group.add(this.model.clone(true)); // comparte geometrías: no se libera
+    group.scale.setScalar(scale * 1000);
+    group.updateMatrixWorld(true);
+    const size = new THREE.Box3().setFromObject(group).getSize(new THREE.Vector3());
+    const data = new STLExporter().parse(group, { binary: true });
+    return { blob: new Blob([data], { type: 'model/stl' }), size };
   }
 
   unload() {
