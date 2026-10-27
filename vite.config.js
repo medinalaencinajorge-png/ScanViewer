@@ -7,6 +7,7 @@ const hardenCsp = {
 };
 
 export default {
+  base: './', // rutas relativas: funciona en la raíz y bajo /ScanViewer/ (GitHub Pages)
   plugins: [hardenCsp],
   build: { sourcemap: false, chunkSizeWarningLimit: 700 },
 };
