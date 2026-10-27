@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self' blob: data: ws:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="ScanViewer" />
+  <meta name="theme-color" content="#0f1115" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <title>ScanViewer</title>
+</head>
+<body>
+  <header class="bar">
+    <button id="btn-library" class="btn" aria-label="Biblioteca">☰ Biblioteca</button>
+    <strong class="title" id="model-name">ScanViewer</strong>
+    <label class="btn primary" for="file-input">+ Subir</label>
+    <input id="file-input" type="file" accept=".glb,.gltf,.obj,.ply,.stl,.usdz" hidden />
+  </header>
+
+  <aside id="library" class="drawer" hidden>
+    <h2>Mis escaneos</h2>
+    <ul id="library-list"></ul>
+    <p id="library-empty" class="muted">Aún no hay escaneos. Exporta uno desde Scaniverse (GLB, OBJ, PLY, STL o USDZ) y súbelo.</p>
+  </aside>
+
+  <main id="stage">
+    <div id="viewport"></div>
+    <div id="measure-label" class="measure-label" hidden></div>
+    <div id="hint" class="hint">Sube un modelo para empezar</div>
+    <div id="status" class="status" role="status" aria-live="polite" hidden></div>
+  </main>
+
+  <footer class="toolbar">
+    <button id="btn-measure" class="btn" aria-pressed="false">📏 Medir</button>
+    <button id="btn-clear" class="btn" disabled>Borrar medida</button>
+    <button id="btn-calibrate" class="btn" disabled>Calibrar</button>
+    <button id="btn-wire" class="btn" aria-pressed="false">Malla</button>
+    <button id="btn-reset" class="btn">Centrar</button>
+  </footer>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
